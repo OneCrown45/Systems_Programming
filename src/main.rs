@@ -1,96 +1,87 @@
-use std::fs;
-use std::time::{Instant, Duration};
-use chrono::{Utc, DateTime};
-use reqwest::Client;
-use tokio;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::{thread, time::{Duration, Instant}};
+use chrono::{DateTime, Utc};
+use std::sync::{mpsc, Arc, Mutex};
+use ureq::Agent;
+use std::fs::File;
+use std::io::{BufReader, BufRead};
 
+#[derive(Debug)]
 struct WebsiteStatus {
     url: String,
-    status: Result<u16, String>, // HTTP status code or error
+    status: Result<u16, String>,
     response_time: Duration,
     timestamp: DateTime<Utc>,
 }
 
-#[tokio::main]
-async fn main() {
+fn check_status(url: String, timeout: Duration) -> WebsiteStatus {
+    let start = Instant::now();
+    let agent: Agent = Agent::new();             
+
+    let resp = match agent.get(&url)
+        .timeout(timeout)
+        .call() {
+            Ok(status) => Ok(status.status()),
+            Err(e) => Err(e.to_string()),
+        };
+
+    WebsiteStatus {
+        url,
+        status: resp,
+        response_time: start.elapsed(),
+        timestamp: Utc::now(),
+    }
+}
+
+fn main() {
     // Load URLs from file
-    let urls = fs::read_to_string("50Website.txt")
-        .expect("Failed to read 50Website.txt")
-        .lines()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
+    let file = File::open("50Websites.txt").expect("Couldn't open file");
+    let buffer = BufReader::new(file);
 
-    println!("Checking {} websites...\n", urls.len());
+    let mut urls: Vec<String> = Vec::new();
+    for line in buffer.lines() {
+        if let Ok(url) = line {
+            urls.push(url);
+        }
+    }
 
-    // HTTP client with 5-second timeout
-    let client = Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    // Optimized settings
+    let timeout = Duration::from_secs(2);   // 2-second timeout
+    let num_workers = urls.len();           // one worker per URL
+    let (tx, rx) = mpsc::channel::<String>();
+    let (result_tx, result_rx) = mpsc::channel::<WebsiteStatus>();
+    let rx = Arc::new(Mutex::new(rx));
 
-    // Shared vector to store results
-    let results = Arc::new(Mutex::new(Vec::new()));
-
-    let mut handles = vec![];
-
-    for url in urls {
-        let client = client.clone();
-        let results = results.clone();
-
-        let handle = tokio::spawn(async move {
-            // Normalize URL
-            let url_clone = if url.starts_with("http") {
-                url.clone()
-            } else {
-                format!("http://{}", url)
-            };
-
-            let start = Instant::now();
-            let timestamp = Utc::now();
-
-            let result = client.get(&url_clone).send().await;
-
-            let website_status = match result {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    WebsiteStatus {
-                        url: url_clone,
-                        status: Ok(status),
-                        response_time: start.elapsed(),
-                        timestamp,
-                    }
-                }
-                Err(e) => WebsiteStatus {
-                    url: url_clone,
-                    status: Err(e.to_string()),
-                    response_time: start.elapsed(),
-                    timestamp,
-                },
-            };
-
-            // Store result
-            results.lock().await.push(website_status);
+    // Spawn workers
+    for _ in 0..num_workers {
+        let rx = Arc::clone(&rx);
+        let result_tx = result_tx.clone();
+        let timeout = timeout.clone();
+        
+        thread::spawn(move || {
+            while let Ok(url) = rx.lock().unwrap().recv() {
+                let status = check_status(url, timeout);
+                result_tx.send(status).unwrap();
+            }
         });
-
-        handles.push(handle);
     }
 
-    // Wait for all tasks to finish
-    for h in handles {
-        let _ = h.await;
+    // Send all URLs then close channel
+    for url in urls {
+        tx.send(url).unwrap();
     }
+    drop(tx);
 
-    // Print all results after completion
-    let results = results.lock().await;
-    for status in results.iter() {
-        println!(
-            "[{}] {} → {:?} ({} ms)",
-            status.timestamp.format("%Y-%m-%d %H:%M:%S"),
-            status.url,
-            status.status,
-            status.response_time.as_millis()
-        );
+    // Collect results
+    for result in result_rx {
+        match result.status {
+            Ok(code) => println!(
+                "[{}] ✅ {} responded with {} in {:?}",
+                result.timestamp, result.url, code, result.response_time
+            ),
+            Err(err) => println!(
+                "[{}] ❌ {} failed: {}",
+                result.timestamp, result.url, err
+            ),
+        }
     }
 }
